@@ -145,7 +145,7 @@ echo "Provisioning..."
 # Upload and provisioning scripts
 
 scp_qemu ${MCIP} pi raspberry pscripts/ /tmp/pscripts
-ssh_qemu ${MCIP} pi raspberry "ls /tmp/pscripts"
+ssh_qemu ${MCIP} pi raspberry "echo 'raspberry' | sudo /tmp/pscripts/setup"
 
 echo "Waiting on QEMU to exit (PID ${QEMU_PID})"
 wait ${QEMU_PID}

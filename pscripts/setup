@@ -2,10 +2,10 @@
 #
 export DEBIAN_FRONTEND=noninteractive
 
-APT_ARGS=-q -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+APT_ARGS='-q -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"'
 
-apt -qq update
-apt -qq -y upgrade
+apt ${APT_ARGS} update
+apt ${APT_ARGS} upgrade
 
 # Insert any instructions for your Raspberry Pi setup here
 
