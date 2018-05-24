@@ -1,0 +1,154 @@
+#!/bin/bash
+#
+# Run a raspbian image in qemu with network access
+# Tested with 2018-04-18-raspbian-stretch-lite.img
+#
+# Usage:
+#   sudo qemu-pi 2018-04-18-raspbian-stretch-lite.img # or any other image
+#
+# Originally inspired by https://github.com/nachoparker/qemu-raspbian-network
+#
+
+# Establish the true absolute path of this script
+script_path() {
+  local _source="${BASH_SOURCE[0]}"
+  local _dir=""
+  while [ -h "${_source}" ]; do # resolve $_source until the file is no longer a symlink
+    _dir="$( cd -P "$( dirname "${_source}" )" && pwd )"
+    _source="$(readlink "${_source}")"
+    [[ ${_source} != /* ]] && _source="${_dir}/${_source}" # if ${_source} was a relative symlink, we need to resolve it relative to the path where the symlink file was located
+  done
+  _dir="$( cd -P "$( dirname "${_source}" )" && pwd )"
+
+  echo ${_dir}
+}
+
+DIR=$(script_path)
+
+. ${DIR}/lib/traps.sh
+. ${DIR}/lib/processes.sh
+. ${DIR}/lib/ssh.sh
+. ${DIR}/lib/host_network.sh
+. ${DIR}/lib/pi.sh
+
+# trap ctrl-c
+trap ctrl_c INT
+
+function ctrl_c() {
+  echo "** Trapped CTRL-C **"
+  echo "Graceful unwind should proceed from here..."
+  exit
+}
+
+IMG=$1
+KERNEL=kernel-qemu-4.4.34-jessie
+
+NO_SSH=${NO_SSH:-0}               # set to 1 to disable SSH in final image
+NO_NETWORK=${NO_NETWORK:-0}       # set to 1 to skip network configuration
+IFACE=${IFACE:-enp0s3}            # interface that we currently use for internet
+BRIDGE=${BRIDGE:-br0}             # name for the bridge we will create to share network with the raspbian img
+MAC=${MAC:-52:54:be:36:42:b9}     # comment this line for random MAC (maybe annoying if on DHCP)
+BINARY_PATH=${BINARY_PATH:-/sbin} # path prefix for binaries
+NO_GRAPHIC=${NO_GRAPHIC:-1}       # set to 1 to start in no graphic mode
+
+# setup checks
+
+NO_NETWORK_ORIGIN=${NO_NETWORK}
+
+test $EUID -eq 0 && test ${NO_NETWORK} -ne 1 || { echo "Must run as root/sudo when networking required"; NO_NETWORK=1; }
+
+type qemu-system-arm &>/dev/null || { echo "QEMU ARM not found"       ; exit 1; }
+test -f $IMG && test -f $KERNEL  || { echo "$IMG or $KERNEL not found"; exit 1; }
+
+[[ "$IFACE" == "" ]] || [[ "$BRIDGE" == "" ]] && NO_NETWORK=1
+
+[[ "$NO_NETWORK" != "1" ]] && {
+    IP=$( ip address show dev "$IFACE" | grep global | grep -oP '\d{1,3}(.\d{1,3}){3}' | head -1 )
+    [[ "$IP" == "" ]]      && { echo "no IP found for $IFACE"; NO_NETWORK=1; }
+    type brctl &>/dev/null || { echo "brctl is not installed"; NO_NETWORK=1; }
+    modprobe tun &>/dev/null
+    grep -q tun <(lsmod)   || { echo "need tun module"       ; NO_NETWORK=1; }
+}
+
+if [[ "${NO_NETWORK}" != "${NO_NETWORK_ORIGIN}" ]]; then
+  echo "Networking cannot be provided. See preceding messages."
+  while true; do
+    read -p "Do you with to continue without networking? " yn
+    case $yn in
+      [Yy]*) echo "Continuing without network configuration."; break;;
+      [Nn]*) exit;;
+      *) echo "Please enter yes or no."
+    esac
+  done
+fi
+
+if [[ "$NO_NETWORK" != "1" ]]; then
+  setup_host_network
+
+  [[ "$MAC" == "" ]] && printf -v MAC "52:54:%02x:%02x:%02x:%02x" \
+    $(( $RANDOM & 0xff )) $(( $RANDOM & 0xff )) $(( $RANDOM & 0xff )) $(( $RANDOM & 0xff ))
+
+  NET_ARGS="-net nic,macaddr=$MAC -net tap,ifname=$TAPIF"
+fi
+
+echo "Mangle Rasbian image (${IMG}) for use in QEMU..."
+turn_on_ssh "$IMG"
+add_drive_remapping "$IMG"
+apply_qemu_arm_patch "$IMG"
+prefix_trap 'echo "Remangling Raspbian image (${IMG}) to restore normal function..."' EXIT
+
+PARAMS_KERNEL="root=/dev/sda2 panic=1"
+if [[ "$NO_GRAPHIC" == "1" ]]; then
+  PARAMS_QEMU="-nographic"
+  PARAMS_KERNEL="$PARAMS_KERNEL vga=normal console=ttyAMA0"
+fi
+
+# do it
+echo "Starting the Raspberry pi"
+
+prefix_trap "rm -f /tmp/qemupipe" EXIT
+if [[ ! -p /tmp/qemupipe ]]; then
+  mkfifo /tmp/qemupipe
+fi
+
+./runqemu -kernel $KERNEL -cpu arm1176 -m 256 -M versatilepb $NET_ARGS $PARAMS_QEMU -no-reboot -drive format=raw,file=$IMG -append "$PARAMS_KERNEL" &
+QEMU_PID=$!
+# Kill the entire Process group associated with the running qemu pi
+# We do thise here so that they are closed when we attempt to restore networking etc.
+prefix_trap "kill_process_tree ${QEMU_PID}" EXIT
+
+# This makes asolutely sure we  attempt to gracefully kill all our associated processes 
+suffix_trap "kill -SIGHUP -- -$(ps -o pgid= ${QEMU_PID} | grep -o '[0-9]*')" EXIT
+
+exec 3</tmp/qemupipe
+
+echo "Waiting for IP address (can take a while)..."
+
+MCIP=$(sed -n -e '/^My IP address is/ s/[^0-9]\+\([0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\).*$/\1/p' -e '/^[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}/ q' <&3)
+
+if [ -z "${MCIP}" ]; then
+  echo "No IP address established for the Raspberry Pi VM" >2
+  exit 1
+else
+  echo "IP Address is ${MCIP}"
+fi
+
+# Make sure pipeline remains clear
+cat <&3 >/dev/null &
+
+# Wait for SSH to become available
+echo "Waiting for SSH to become available..."
+wait_on_ssh ${MCIP} pi raspberry
+[[ $? != 0 ]] && echo "Failed to connect to SSH. Exiting." && exit 1
+echo "Provisioning..."
+
+# Upload and provisioning scripts
+
+scp_qemu ${MCIP} pi raspberry pscripts/ /tmp/pscripts
+ssh_qemu ${MCIP} pi raspberry "ls /tmp/pscripts"
+
+echo "Waiting on QEMU to exit (PID ${QEMU_PID})"
+wait ${QEMU_PID}
+echo "QEMU ended with status $?"
+
+exit

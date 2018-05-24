@@ -1,0 +1,14 @@
+#!/bin/bash
+#
+export DEBIAN_FRONTEND=noninteractive
+
+APT_ARGS=-q -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+
+apt -qq update
+apt -qq -y upgrade
+
+# Insert any instructions for your Raspberry Pi setup here
+
+# Comment out this line if you want the Rapsberry Pi image to continue running after installation is complete
+
+shutdown -h now

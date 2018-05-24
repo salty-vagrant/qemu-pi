@@ -1,0 +1,9 @@
+#!/bin/bash
+exec 3>/tmp/qemupipe
+exec &> >(tee -a "./qemu-pi.out" >&3)
+
+echo "Starting QEMU Pi"
+
+qemu-system-arm "$@"
+
+echo "QEMU Pi closed"
